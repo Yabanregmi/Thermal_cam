@@ -1,0 +1,12 @@
+c_env/
+camera_env/
+*.pyc
+__pycache__/
+*.pyo
+*.pyd
+*.pdb
+*.log
+*.egg-info/
+*.egg
+*.whl
+dist/
