@@ -1,79 +1,88 @@
-const fs = require('fs');
+const express = require('express');
 const speakeasy = require('speakeasy');
 const qrcode = require('qrcode');
-const readline = require('readline-sync');
+const fs = require('fs');
+const bodyParser = require('body-parser');
+const path = require('path');
 
-const SECRET_FILE = '2fa_secret.txt';
+const app = express();
+app.set('view engine', 'ejs');
+app.use(bodyParser.urlencoded({ extended: false }));
+app.use(express.static('public'));
 
-// Load or create a TOTP secret
-function getOrCreateSecret() {
-  if (fs.existsSync(SECRET_FILE)) {
-    const secret = fs.readFileSync(SECRET_FILE, 'utf8').trim();
-    console.log('[INFO] Loaded existing secret from file.');
-    return secret;
-  } else {
-    const secret = speakeasy.generateSecret({ length: 32 });
-    fs.writeFileSync(SECRET_FILE, secret.base32);
-    console.log('[INFO] Generated and saved new secret.');
-    generateQRCode(secret);
-    return secret.base32;
-  }
+const USERS_DB = './users.json';
+
+function loadUser(email) {
+  const data = JSON.parse(fs.readFileSync(USERS_DB));
+  return data[email];
 }
 
-// Generate QR code for Google Authenticator
-function generateQRCode(secret, filename = 'qrcode.png') {
-  const otpauthURL = speakeasy.otpauthURL({
-    secret: secret.base32 || secret, // if full secret object, extract base32
-    label: 'user@example.com',
-    issuer: 'MyApp',
-    encoding: 'base32'
-  });
-
-  qrcode.toFile(filename, otpauthURL, (err) => {
-    if (err) throw err;
-    console.log(`[INFO] QR code saved as ${filename} (scan with Google Authenticator).`);
-  });
+function saveUser(user) {
+  const data = JSON.parse(fs.readFileSync(USERS_DB));
+  data[user.email] = user;
+  fs.writeFileSync(USERS_DB, JSON.stringify(data, null, 2));
 }
 
-// Verify OTP code entered by user
-function verifyOTP(secret) {
-  const token = readline.question('Enter the OTP from your authenticator app: ');
+// --- 2FA SETUP ---
+app.get('/setup-2fa', (req, res) => {
+  const user = loadUser('user@example.com');
+
+  const secret = speakeasy.generateSecret({
+    name: `MyApp (${user.email})`
+  });
+
+  user.otpSecret = secret.base32;
+  saveUser(user);
+
+  const otpauth = speakeasy.otpauthURL({
+    secret: secret.base32,
+    label: user.email,
+    issuer: 'MyApp'
+  });
+
+  qrcode.toDataURL(otpauth, (err, dataUrl) => {
+    res.render('setup', { qr: dataUrl });
+  });
+});
+
+app.post('/verify-2fa-setup', (req, res) => {
+  const user = loadUser('user@example.com');
   const verified = speakeasy.totp.verify({
-    secret,
+    secret: user.otpSecret,
     encoding: 'base32',
-    token
+    token: req.body.otp
   });
-
-  const currentOTP = speakeasy.totp({
-    secret,
-    encoding: 'base32'
-  });
-
-  console.log('[DEBUG] Current OTP (for testing):', currentOTP);
 
   if (verified) {
-    console.log('[SUCCESS] OTP is valid!');
+    user.is2faEnabled = true;
+    saveUser(user);
+    res.send(' 2FA wurde erfolgreich aktiviert.');
   } else {
-    console.log('[ERROR] Invalid OTP. Check the time sync and the code.');
+    res.send(' Ungültiger Code. Bitte erneut versuchen.');
   }
-}
+});
 
-// Generate QR code for a new device
-function addNewDevice(secret) {
-  generateQRCode(secret, 'qrcode_new_device.png');
-  console.log('[INFO] Use qrcode_new_device.png to add another device.');
-}
+// --- 2FA LOGIN ---
+app.get('/login', (req, res) => {
+  const user = loadUser('user@example.com');
+  if (!user.is2faEnabled) return res.redirect('/setup-2fa');
+  res.render('verify');
+});
 
-// Main entry point
-function main() {
-  const args = process.argv.slice(2);
-  const secret = getOrCreateSecret();
+app.post('/login', (req, res) => {
+  const user = loadUser('user@example.com');
+  const verified = speakeasy.totp.verify({
+    secret: user.otpSecret,
+    encoding: 'base32',
+    token: req.body.otp,
+    window: 1
+  });
 
-  if (args.includes('--new-device')) {
-    addNewDevice(secret);
+  if (verified) {
+    res.send(' Login erfolgreich mit 2FA!');
   } else {
-    verifyOTP(secret);
+    res.send(' Falscher 2FA-Code.');
   }
-}
+});
 
-main();
+app.listen(3000, () => console.log('2FA App läuft auf http://localhost:3000'));
