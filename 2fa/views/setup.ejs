@@ -1,0 +1,13 @@
+<!DOCTYPE html>
+<html>
+<head><title>2FA Setup</title></head>
+<body>
+  <h2>Scan this QR code in your Authenticator app</h2>
+  <img src="<%= qr %>">
+  <form action="/verify-2fa-setup" method="POST">
+    <label>Enter OTP:</label>
+    <input name="otp" type="text" required>
+    <button type="submit">Verify</button>
+  </form>
+</body>
+</html>

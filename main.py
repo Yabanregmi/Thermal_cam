@@ -8,6 +8,8 @@ import json
 import logging
 import csv
 from queue import Queue
+import socketio
+
 
 
 USE_MOCK_CAMERA = True
@@ -90,6 +92,10 @@ MANUAL_RECORD_LIMIT = 600  # Default manual recording limit (in seconds)
 anomaly_queue = Queue()
 anomaly_worker_thread = None
 anomaly_active = False  # tracks ongoing anomaly
+sio = socketio.Client()
+logger = logging.getLogger("IR_App")
+events_ir = None  # Placeholder for IR app events(from IRAppProcess)
+queue_ir = None  # Placeholder for IR app queue(from IRAppProcess)
 
 
 from collections import deque
@@ -580,6 +586,297 @@ def set_recording_type_from_server(rec_type, user="server"):
     logging.warning(f"Invalid recording type requested: {rec_type}")
     return False
 
+def set_config(data):
+    try:
+        payload = data.get("payload", {})
+        user = data.get("user", "server")
+        request_id = data.get("request_id", "n/a")
+
+        if mode != SystemMode.TEST:
+            ack_config(request_id, "error", "Configuration changes only allowed in TEST mode.")
+            return
+
+        if "start_threshold" in payload:
+            set_start_threshold(payload["start_threshold"], user)
+        if "stop_threshold" in payload:
+            set_stop_threshold(payload["stop_threshold"], user)
+        if "duration" in payload:
+            set_duration(payload["duration"], user)
+        if "manual_record_limit" in payload:
+            set_manual_record_limit(payload["manual_record_limit"], user)
+        if "save_dir" in payload:
+            set_save_dir(payload["save_dir"], user)
+        if "event_recording_enabled" in payload:
+            if payload["event_recording_enabled"]:
+                enable_event_recording(user)
+            else:
+                disable_event_recording(user)
+        if "mode" in payload:
+            set_mode(payload["mode"], user)
+        if "recording_type" in payload:
+            set_recording_type_from_server(payload["recording_type"], user)
+
+        logger.info(f"[CONFIG] Updated by {user}: {payload}")
+        ack_config(request_id, "success", "Configuration updated.")
+
+    except Exception as e:
+        logger.info(f"Failed to set config: {e}")
+        ack_config(data.get("request_id", "n/a"), "error", str(e))
+
+def ack_config(request_id, status, message):
+    sio.emit("ack_config", {
+        "request_id": request_id,
+        "status": status,
+        "message": message,
+        "mode": mode,
+        "threshold": TEMP_THRESHOLD,
+        "start_threshold": START_THRESHOLD,
+        "stop_threshold": STOP_THRESHOLD,
+        "duration": POST_EVENT_DURATION,
+        "recording_type": recording_type
+    })
+
+def set_temperature(data):
+    """
+    Handles temperature threshold setting from the server.
+    Example data:
+    {
+        "command": "set_temperature",
+        "request_id": "abc123",
+        "payload": {
+            "temp_threshold": 52.5
+        }
+    }
+    """
+    request_id = data.get("request_id", "n/a")
+    payload = data.get("payload", {})
+    temp_value = payload.get("temp_threshold")
+
+    if temp_value is None:
+        return ack_set_temperature(request_id, "error", "Missing 'temp_threshold' value")
+
+    try:
+        set_threshold(temp_value, user="server")
+        return ack_set_temperature(request_id, "success", f"Temperature threshold set to {temp_value}°C")
+    except Exception as e:
+        return ack_set_temperature(request_id, "error", f"Failed to set temperature: {e}")
+
+def ack_set_temperature(request_id, status, message):
+    sio.emit("ack_set_temperature", {
+        "request_id": request_id,
+        "status": status,
+        "message": message
+    })
+
+
+
+def manual_start_record(data):
+    request_id = data.get("request_id", "n/a")
+    if mode != SystemMode.TEST:
+        ack_manual_start_record(request_id, "error", "Only allowed in TEST mode")
+        return
+
+    if not recording:
+        global manual_record_thread, recording
+        manual_record_thread = threading.Thread(
+            target=record_video, args=(cam, mode, POST_EVENT_DURATION))
+        manual_record_thread.start()
+        recording = True
+        ack_manual_start_record(request_id, "success", "Recording started")
+    else:
+        ack_manual_start_record(request_id, "error", "Already recording")
+
+def ack_manual_start_record(request_id, status, message):
+    sio.emit("ack_manual_start_record", {
+        "request_id": request_id,
+        "status": status,
+        "message": message
+    })
+
+def manual_stop_record(data):
+    request_id = data.get("request_id", "n/a")
+    success = stop_manual_recording_from_server()
+    if success:
+        ack_manual_stop_record(request_id, "success", "Recording stopped")
+    else:
+        ack_manual_stop_record(request_id, "error", "No active recording")
+
+def ack_manual_stop_record(request_id, status, message):
+    sio.emit("ack_manual_stop_record", {
+        "request_id": request_id,
+        "status": status,
+        "message": message
+    })
+
+
+def timeout_stop_record(data):
+    request_id = data.get("request_id", "n/a")
+    global manual_stop_flag, recording
+    if recording:
+        manual_stop_flag = True
+        ack_timeout_stop_record(request_id, "success", "Recording timed out and stopped")
+    else:
+        ack_timeout_stop_record(request_id, "error", "Nothing was recording")
+
+def ack_timeout_stop_record(request_id, status, message):
+    sio.emit("ack_timeout_stop_record", {
+        "request_id": request_id,
+        "status": status,
+        "message": message
+    })
+
+def call_live_temperature(data):
+    request_id = data.get("request_id", "n/a")
+    global temp
+    ack_live_temperature(request_id, "success", {
+        "temp": temp,
+        "mode": mode,
+        "recording": recording
+    })
+
+def ack_live_temperature(request_id, status, info):
+    sio.emit("ack_live_temperature", {
+        "request_id": request_id,
+        "status": status,
+        "temperature": info.get("temp"),
+        "mode": info.get("mode"),
+        "recording": info.get("recording")
+    })
+
+def call_history_temperature(data):
+    request_id = data.get("request_id", "n/a")
+    recent_errors = get_recent_errors(limit=10)
+    ack_history_temperature(request_id, "success", recent_errors)
+
+def ack_history_temperature(request_id, status, errors):
+    sio.emit("ack_history_temperature", {
+        "request_id": request_id,
+        "status": status,
+        "errors": errors
+    })
+
+def set_event(data):
+    request_id = data.get("request_id", "n/a")
+    enable = data.get("enable", True)
+
+    if enable:
+        enable_event_recording()
+        ack_event(request_id, "success", "Event recording enabled")
+    else:
+        disable_event_recording()
+        ack_event(request_id, "success", "Event recording disabled")
+
+def ack_event(request_id, status, message):
+    sio.emit("ack_event", {
+        "request_id": request_id,
+        "status": status,
+        "message": message
+    })
+
+def call_record(data):
+    request_id = data.get("request_id", "n/a")
+    if mode == SystemMode.TEST:
+        cam.trigger_anomaly()
+        ack_call_record(request_id, "success", "Test anomaly triggered")
+    else:
+        ack_call_record(request_id, "error", "Only allowed in TEST mode")
+
+def ack_call_record(request_id, status, message):
+    sio.emit("ack_call_record", {
+        "request_id": request_id,
+        "status": status,
+        "message": message
+    })
+
+def reset_alarm(data):
+    logging.info("Alarm reset requested")
+    # Example: turn off relais, reset flags
+    try:
+        set_relais_state(False)
+        ack_reset_alarm(data.get("request_id", "n/a"), "success", "Alarm reset successful.")
+    except Exception as e:
+        ack_reset_alarm(data.get("request_id", "n/a"), "error", str(e))
+
+def ack_reset_alarm(request_id, status, message):
+    sio.emit("ack_reset_alarm", {
+        "request_id": request_id,
+        "status": status,
+        "message": message
+    })
+
+def reset_error(data):
+    request_id = data.get("request_id", "n/a")
+    try:
+        # Clear internal error history
+        error_history.clear()
+
+        # Optionally, reset system state if needed
+        # Example: unfreeze relais, restart components, etc.
+        unfreeze_relais()
+
+        logging.info("Error state cleared by server.")
+        ack_reset_error(request_id, "success", "Error state cleared successfully.")
+    except Exception as e:
+        log_error_to_user(f"Failed to reset error: {e}")
+        ack_reset_error(request_id, "error", str(e))
+
+def ack_reset_error(request_id, status, message):
+    sio.emit("ack_reset_error", {
+        "request_id": request_id,
+        "status": status,
+        "message": message
+    })
+
+
+
+# IR Command Handler    
+def ir_command_handler(queue):
+    while True:
+        try:
+            command, data = queue.get()
+            logger.info(f"[IR COMMAND] Received: {command} | Data: {data}")
+
+            if command == "set_config":
+                set_config(data)
+
+            elif command == "set_temperature":
+                set_temperature(data)
+
+            elif command == "manual_start_record":
+                manual_start_record(data)
+
+            elif command == "manual_stop_record":
+                manual_stop_record(data)
+
+            elif command == "timeout_stop_record":
+                timeout_stop_record(data)
+
+            elif command == "call_live_tempreture":  # Note: fix spelling if needed
+                call_live_temperature(data)
+
+            elif command == "call_history_tempreture":
+                call_history_temperature(data)
+
+            elif command == "set_event":
+                set_event(data)
+
+            elif command == "call_record":
+                call_record(data)
+
+            elif command == "reset_alarm":
+                reset_alarm(data)
+
+            elif command == "reset_error":
+                reset_error(data)
+
+            else:
+                logger.warning(f"[IR COMMAND] Unknown command: {command}")
+
+        except Exception as e:
+            logger.error(f"[IR COMMAND] Handler error: {e}")
+
+
+
 
 
 # Main Loop 
@@ -600,6 +897,8 @@ def main():
     try:
         cam = CameraController()
         db = FrameDatabase("frame_store.db")
+        threading.Thread(target=ir_command_handler, args=(queue_ir,), daemon=True).start()
+
     except Exception as e:
         logging.critical(f"Failed to initialize camera or DB: {e}")
         mode = SystemMode.FAULT
@@ -657,6 +956,14 @@ def main():
             try:
                 with camera_lock:
                     frame, temp = cam.get_frame()
+                    # Send heartbeat to überwachung.py (IRAppProcess)
+                try:
+                    if 'events_ir' in globals() and events_ir:
+                        events_ir.heartbeat.set()
+                except Exception:
+                    pass
+
+
                 if frame is None:
                     log_error_to_user("Camera returned no frame. Switching to FAULT mode.")
                     set_mode(SystemMode.FAULT)

@@ -1,0 +1,5 @@
+node_modules/
+__pycache__/
+.c_env/
+.camera_env/
+dustin/__pycache__/
