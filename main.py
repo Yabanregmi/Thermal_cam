@@ -12,7 +12,7 @@ import socketio
 
 
 
-USE_MOCK_CAMERA = True
+USE_MOCK_CAMERA = False
 USE_MOCK_IO = False
 USE_MOCK_DB = False
 
@@ -897,13 +897,30 @@ def main():
     try:
         cam = CameraController()
         db = FrameDatabase("frame_store.db")
-        threading.Thread(target=ir_command_handler, args=(queue_ir,), daemon=True).start()
+
+        # One-time probe – ensures the device is actually delivering frames
+        with camera_lock:
+            frame, temp = cam.get_frame()
+        if frame is None or frame.size == 0:
+            raise RuntimeError("Camera probe returned empty/invalid frame")
+
+
+        # Start IR command handler only if a real queue is available
+        if queue_ir is None:
+            # Option A: create a local queue so the handler doesn't crash
+            queue_ir_local = Queue()
+            threading.Thread(target=ir_command_handler, args=(queue_ir_local,), daemon=True).start()
+        else:
+            # Option B: use the provided queue from the orchestrator
+            threading.Thread(target=ir_command_handler, args=(queue_ir,), daemon=True).start()
+
 
     except Exception as e:
-        logging.critical(f"Failed to initialize camera or DB: {e}")
+        logging.critical("Failed to initialize camera or DB:\n%s", traceback.format_exc())
         mode = SystemMode.FAULT
         event_recording_enabled = False
         cam = None
+
 
 
     try:
@@ -925,7 +942,7 @@ def main():
                 manual_record_thread = threading.Thread(
                     target=record_video, args=(cam, mode, POST_EVENT_DURATION))
                 manual_record_thread.start()
-                recording = True
+               
 
             elif key == ord('a') and USE_MOCK_CAMERA:
                 cam.trigger_anomaly()
@@ -939,13 +956,16 @@ def main():
                 freeze_relais()
             elif key == ord('u') and mode == SystemMode.TEST:
                 unfreeze_relais()
-            elif key == ord('f'):  # Reinitialize the camera
-                    try:
-                        cam = CameraController()
-                        logging.info("Camera re-initialized successfully. Switching to NORMAL mode.")
-                        set_mode(SystemMode.NORMAL)
-                    except Exception as e:
-                        log_error_to_user(f"Failed to initialize camera or DB: {e}")
+            elif key == ord('R'):  # capital R for Reinitialize
+                try:
+                    cam = CameraController()
+                    with camera_lock:
+                        _f, _t = cam.get_frame()  # probe to verify
+                    logging.info("Camera re-initialized successfully. Switching to NORMAL mode.")
+                    set_mode(SystemMode.NORMAL)
+                except Exception:
+                    log_error_to_user("Failed to re-initialize camera:\n" + traceback.format_exc())
+
 
 
 
